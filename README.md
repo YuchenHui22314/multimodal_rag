@@ -12,7 +12,7 @@ Qilin is a large-scale multimodal dataset designed for advancing research in sea
 
 **[2024-03-27]** 🚀 Qilin surpasses 1,000 downloads on [HuggingFace](https://huggingface.co/datasets/THUIR/qilin)! Thank you for your support!
 
-**[2024-03-18]** 🔥Image resources are now available for download through [Tsinghua Cloud](https://cloud.tsinghua.edu.cn/d/af72ab5dbba1460da6c0/)! 
+**[2024-03-18]** 🔥Image resources are now available for download through [Baidu Cloud](https://pan.baidu.com/s/1OC098qc2seV_FQlEo5ZBlg?pwd=cyh6)! code: cyh6 
 
 ## Dataset Overview
 
