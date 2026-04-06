@@ -1,0 +1,52 @@
+# Asymmetric bi-encoder: Full fine-tune BGE query encoder
+# Query encoder : BAAI/bge-base-zh-v1.5 (768-dim, all params trainable)
+# Doc side      : pre-encoded Qwen3-VL-2B embeddings, MRL-truncated to 768
+
+project_name: "asym_biencoder"
+project_dir: "output_asym_biencoder"
+wandb_project: "qilin_multimodal_ir"
+mixed_precision: "fp16"
+
+model:
+  variant: "fullft"              # fullft | lora | query_mlp | doc_mlp | both_mlp
+  proj_type: "mlp"               # mlp | glu  (unused for fullft/lora)
+  model_name_or_path: "/data/rech/huiyuche/huggingface/models--BAAI--bge-base-zh-v1.5/snapshots/f03589ceff5aac7111bd60cfc7d497ca17ecac65"
+  doc_dim: 768                   # doc embeddings truncated to 768 (MRL) at load time
+
+datasets:
+  dataset_name_or_path: "/data/rech/huiyuche/multimodal_rag/datasets/qilin/"
+  doc_emb_dir: "/part/01/Tmp/yuchenhui/multimodal_rag/embeddings/qilin_qwen3vl_fp16"
+  batch_size: 32                 # queries per step (each with 1 pos + 6 neg docs)
+  negative_samples: 6            # negatives per query (same as Qilin DPR baseline)
+  max_length: 256                # max query token length
+  num_workers: 4
+  use_title: true
+  use_content: true
+  query_instruction: ""          # prepend to query (empty = none)
+  # max_encoded_note_idx: null   # set to an int to restrict debug runs
+
+training:
+  num_epochs: 5
+  eval_steps: 1000
+  save_steps: 1000
+  log_steps: 50
+  negatives_x_device: true      # gather negatives across GPUs
+  resume: false
+
+# Hyperparameters -- full fine-tune needs lower LR than projection-only
+optimizer:
+  name: AdamW
+  kwargs:
+    lr: 1.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+scheduler:
+  name: LinearLR
+  kwargs:
+    warmup_steps: 200
+
+evaluation:
+  target_metric: "MRR@10"
+  qrels_data_path: "/data/rech/huiyuche/multimodal_rag/datasets/search.test.qrels.csv"

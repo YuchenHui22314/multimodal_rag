@@ -1,0 +1,28 @@
+# Outputs and logs
+output_*/
+logs/
+*.log
+wandb/
+
+# Large model/embedding files
+*.npy
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env
+.env
+*.env
+
+# HuggingFace cache
+.cache/
