@@ -1,2 +1,25 @@
 .DS_Store
 git-push.sh
+
+# Large data / model files
+datasets/
+embeddings/
+*.npy
+*.bin
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.parquet
+*.arrow
+*.pkl
+*.pickle
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+.cache/
