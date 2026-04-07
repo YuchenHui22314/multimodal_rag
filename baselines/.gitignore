@@ -2,6 +2,8 @@
 output_*/
 logs/
 *.log
+*.txt
+*.csv
 wandb/
 
 # Large model/embedding files

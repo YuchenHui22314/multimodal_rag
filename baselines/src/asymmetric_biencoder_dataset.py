@@ -6,19 +6,20 @@ Key design:
   - Query text is returned raw (tokenized in collate_fn by the caller)
   - Document embeddings are fetched from pre-computed numpy mmap files
     produced by encode_qwen3vl.py (2048-dim per note)
-  - Positive/negative sampling follows the same strategy as the original
-    Qilin DenseRetrievalTrainingDataProcessor:
-      positive  : one randomly-sampled clicked note (click == 1)
-      negatives : N randomly-sampled non-clicked notes from the impression
-                  padded with random corpus samples when not enough
+  - Every clicked note becomes an independent positive training sample.
+  - Negatives are sampled from non-clicked notes in the same impression,
+    padded with random corpus samples when not enough.
 
 Usage example (see train_asymmetric_biencoder.py):
     dataset = AsymmetricBiEncoderDataset(config)
     loader  = DataLoader(dataset, batch_size=B, collate_fn=dataset.collate_fn, ...)
 """
 
+import glob
+import os
 import random
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
@@ -58,8 +59,14 @@ class AsymmetricBiEncoderDataset(Dataset):
 
         # ---- Load Qilin search_train split ----
         data_path = dset_cfg["dataset_name_or_path"]
+        local_parquet = os.path.join(data_path, "search_train", "train-00000-of-00001.parquet")
         print(f"[Dataset] Loading Qilin search_train from {data_path} …")
-        self.dataset = load_dataset("THUIR/Qilin", "search_train")["train"]
+        if os.path.exists(local_parquet):
+            self.dataset = pd.read_parquet(local_parquet)
+            print(f"[Dataset] Loaded local parquet cache: {local_parquet}")
+        else:
+            self.dataset = load_dataset("THUIR/Qilin", "search_train")["train"]
+            print("[Dataset] Loaded search_train from HuggingFace cache/hub")
         print(f"[Dataset] search_train size: {len(self.dataset)}")
 
         # Corpus size (for random negative sampling)
@@ -68,83 +75,142 @@ class AsymmetricBiEncoderDataset(Dataset):
 
         # ---- Load pre-computed doc embeddings (memory-mapped) ----
         emb_dir = dset_cfg["doc_emb_dir"]
-        gpu0_path = f"{emb_dir}/passage_gpu_0.npy"
-        gpu1_path = f"{emb_dir}/passage_gpu_1.npy"
         print(f"[Dataset] Loading doc embeddings (mmap) from {emb_dir} …")
-        self._emb_gpu0 = np.load(gpu0_path, mmap_mode="r")  # [shard0_size, 2048]
-        self._emb_gpu1 = np.load(gpu1_path, mmap_mode="r")  # [shard1_size, 2048]
-        self._shard_size = len(self._emb_gpu0)               # 991969
-        self.corpus_size  = len(self._emb_gpu0) + len(self._emb_gpu1)
-        print(f"[Dataset] Corpus size: {self.corpus_size} "
-              f"(shard0={len(self._emb_gpu0)}, shard1={len(self._emb_gpu1)})")
+        shard_paths = sorted(glob.glob(os.path.join(emb_dir, "passage_gpu_*.npy")))
+        if not shard_paths:
+            raise FileNotFoundError(
+                f"No passage shards found under {emb_dir}. "
+                "Expected files like passage_gpu_0.npy"
+            )
+
+        self._emb_shards = [np.load(path, mmap_mode="r") for path in shard_paths]
+        self._shard_sizes = [len(shard) for shard in self._emb_shards]
+        self._shard_offsets = []
+
+        offset = 0
+        for shard_size in self._shard_sizes:
+            self._shard_offsets.append(offset)
+            offset += shard_size
+
+        self.corpus_size = offset
+        shard_desc = ", ".join(
+            f"shard{i}={size}" for i, size in enumerate(self._shard_sizes)
+        )
+        print(f"[Dataset] Corpus size: {self.corpus_size} ({shard_desc})")
 
         # ---- Optional: limit to queries whose pos+neg are already encoded ----
         # Set max_encoded_note_idx in config to restrict debug runs.
         # Only note_idxs < max_encoded_note_idx are guaranteed to have real embeddings.
         self.max_encoded_idx = dset_cfg.get("max_encoded_note_idx", None)
+        self.sample_cache_dir = dset_cfg.get(
+            "sample_cache_dir",
+            "/data/rech/zhangyan/multimodal_rag/baselines/cache/asym_dataset",
+        )
 
-        # Pre-filter dataset if max_encoded_idx is set
-        if self.max_encoded_idx is not None:
-            print(f"[Dataset] Filtering to note_idx < {self.max_encoded_idx} …")
-            self._valid_indices = [
-                i for i, item in enumerate(self.dataset)
-                if self._sample_has_encoded_docs(item)
-            ]
-            print(f"[Dataset] {len(self._valid_indices)} / {len(self.dataset)} "
-                  f"samples have all docs encoded")
-        else:
-            self._valid_indices = list(range(len(self.dataset)))
+        self._build_samples()
 
     # ------------------------------------------------------------------
-    def _sample_has_encoded_docs(self, item: dict) -> bool:
-        """Check that at least one positive and N negatives are within encoded range."""
-        max_idx = self.max_encoded_idx
+    def _get_item(self, idx: int):
+        return self.dataset.iloc[idx] if hasattr(self.dataset, "iloc") else self.dataset[idx]
+
+    def _get_positive_pool(self, item) -> list[int]:
         impressions = item.get("search_result_details_with_idx", [])
-        positives   = [x["note_idx"] for x in impressions if x["click"] == 1
-                       and x["note_idx"] < max_idx]
-        negatives   = [x["note_idx"] for x in impressions if x["click"] == 0
-                       and x["note_idx"] < max_idx]
-        return len(positives) >= 1 and len(negatives) >= 1  # at least 1 neg; pad rest randomly
+        if self.max_encoded_idx is not None:
+            return [
+                x["note_idx"] for x in impressions
+                if x["click"] == 1 and x["note_idx"] < self.max_encoded_idx
+            ]
+        return [x["note_idx"] for x in impressions if x["click"] == 1]
+
+    def _get_negative_pool(self, item) -> list[int]:
+        impressions = item.get("search_result_details_with_idx", [])
+        if self.max_encoded_idx is not None:
+            return [
+                x["note_idx"] for x in impressions
+                if x["click"] == 0 and x["note_idx"] < self.max_encoded_idx
+            ]
+        return [x["note_idx"] for x in impressions if x["click"] == 0]
+
+    def _build_samples(self):
+        """
+        Expand each (query, positive) pair into an independent training sample.
+
+        This uses all clicked notes instead of randomly sampling one positive
+        per query, which better matches Qilin's multi-positive supervision.
+        """
+        os.makedirs(self.sample_cache_dir, exist_ok=True)
+        max_idx_tag = self.max_encoded_idx if self.max_encoded_idx is not None else "all"
+        cache_path = os.path.join(
+            self.sample_cache_dir,
+            f"{self.__class__.__name__}_{len(self.dataset)}q_max{max_idx_tag}.npz",
+        )
+
+        if os.path.exists(cache_path):
+            cache = np.load(cache_path)
+            item_indices = cache["item_indices"].astype(np.int64)
+            positive_indices = cache["positive_indices"].astype(np.int64)
+            self.samples = list(zip(item_indices.tolist(), positive_indices.tolist()))
+            print(f"[Dataset] Loaded expanded sample cache: {cache_path}")
+            print(f"[Dataset] Expanded training samples: {len(self.samples)} "
+                  f"from {len(self.dataset)} queries")
+            return
+
+        self.samples = []
+        for item_idx in range(len(self.dataset)):
+            item = self._get_item(item_idx)
+            positives = self._get_positive_pool(item)
+            negatives = self._get_negative_pool(item)
+            if not positives or not negatives:
+                continue
+            for positive_idx in positives:
+                self.samples.append((item_idx, positive_idx))
+
+        if self.samples:
+            item_indices = np.asarray([sample[0] for sample in self.samples], dtype=np.int32)
+            positive_indices = np.asarray([sample[1] for sample in self.samples], dtype=np.int32)
+            np.savez_compressed(
+                cache_path,
+                item_indices=item_indices,
+                positive_indices=positive_indices,
+            )
+            print(f"[Dataset] Saved expanded sample cache: {cache_path}")
+
+        print(f"[Dataset] Expanded training samples: {len(self.samples)} "
+              f"from {len(self.dataset)} queries")
 
     # ------------------------------------------------------------------
     def _get_emb(self, note_idx: int) -> np.ndarray:
         """Fetch pre-computed embedding for note_idx (shape [truncate_dim])."""
-        if note_idx < self._shard_size:
-            raw = self._emb_gpu0[note_idx, :self.truncate_dim]
-        else:
-            raw = self._emb_gpu1[note_idx - self._shard_size, :self.truncate_dim]
+        if note_idx < 0 or note_idx >= self.corpus_size:
+            raise IndexError(f"note_idx {note_idx} out of range for corpus size {self.corpus_size}")
+
+        shard_id = len(self._shard_offsets) - 1
+        for idx, offset in enumerate(self._shard_offsets):
+            next_offset = self.corpus_size if idx + 1 == len(self._shard_offsets) else self._shard_offsets[idx + 1]
+            if offset <= note_idx < next_offset:
+                shard_id = idx
+                break
+
+        local_idx = note_idx - self._shard_offsets[shard_id]
+        raw = self._emb_shards[shard_id][local_idx, :self.truncate_dim]
         return raw.copy()  # copy from mmap to avoid stale references
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
-        return len(self._valid_indices)
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
-        real_idx = self._valid_indices[idx]
-        item = self.dataset[real_idx]
+        real_idx, positive_idx = self.samples[idx]
+        item = self._get_item(real_idx)
 
         # ---- Query text ----
         query = item["query"]
 
         # ---- Positive note ----
-        impressions = item["search_result_details_with_idx"]
-
-        # Filter to encoded range if needed
-        if self.max_encoded_idx is not None:
-            pos_pool = [x["note_idx"] for x in impressions if x["click"] == 1
-                        and x["note_idx"] < self.max_encoded_idx]
-        else:
-            pos_pool = [x["note_idx"] for x in impressions if x["click"] == 1]
-
-        positive_idx = random.choice(pos_pool)
         pos_emb = self._get_emb(positive_idx)
 
         # ---- Negative notes ----
-        if self.max_encoded_idx is not None:
-            neg_pool = [x["note_idx"] for x in impressions if x["click"] == 0
-                        and x["note_idx"] < self.max_encoded_idx]
-        else:
-            neg_pool = [x["note_idx"] for x in impressions if x["click"] == 0]
+        neg_pool = self._get_negative_pool(item)
 
         if len(neg_pool) < self.N_neg:
             # Pad with random corpus samples (within encoded range if needed)

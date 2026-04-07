@@ -33,10 +33,12 @@ import argparse
 import logging
 from datetime import datetime
 from pathlib import Path
+import glob
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 import yaml
 import wandb
 from accelerate import Accelerator
@@ -46,6 +48,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(__file__))
 from asymmetric_biencoder_model import AsymmetricBiEncoderModel
 from asymmetric_biencoder_dataset import AsymmetricBiEncoderDataset
+from asymmetric_biencoder_eval import AsymmetricBiEncoderEvaluator
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +58,7 @@ from asymmetric_biencoder_dataset import AsymmetricBiEncoderDataset
 def setup_logger(log_path: str, name: str = "asym") -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
+    logger.handlers.clear()
     fmt = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
     # Console
@@ -83,7 +87,7 @@ def load_config(config_path: str, overrides: dict) -> dict:
         d = cfg
         for key in keys[:-1]:
             d = d[key]
-        d[keys[-1]] = v
+        d[keys[-1]] = yaml.safe_load(v)
     return cfg
 
 
@@ -106,9 +110,15 @@ def contrastive_loss(query_emb: torch.Tensor, doc_emb: torch.Tensor,
         accelerator      : HuggingFace Accelerator instance
     """
     if negatives_x_device:
-        # Gather across all GPUs → larger effective batch of negatives
-        query_emb = accelerator.gather(query_emb)
-        doc_emb   = accelerator.gather(doc_emb)
+        # Gather across all GPUs with autograd support so projection/query
+        # parameters can still receive gradients in multi-GPU training.
+        if accelerator.num_processes > 1 and dist.is_initialized():
+            from torch.distributed.nn.functional import all_gather
+            query_emb = torch.cat(list(all_gather(query_emb)), dim=0)
+            doc_emb   = torch.cat(list(all_gather(doc_emb)), dim=0)
+        else:
+            query_emb = accelerator.gather(query_emb)
+            doc_emb   = accelerator.gather(doc_emb)
 
     # Similarity matrix [B, B*(1+n_neg)]
     scores = torch.matmul(query_emb, doc_emb.T)
@@ -127,25 +137,24 @@ def contrastive_loss(query_emb: torch.Tensor, doc_emb: torch.Tensor,
 
 def save_checkpoint(model: AsymmetricBiEncoderModel, optimizer,
                     scheduler, step: int, best_metric: float,
-                    save_dir: str, suffix: str = ""):
+                    ckpt_dir: str, epoch: int):
     """Save model, optimizer, scheduler states and training metadata."""
-    ckpt_dir = os.path.join(save_dir, f"checkpoint{suffix}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
     model.save(ckpt_dir)
     torch.save(optimizer.state_dict(), f"{ckpt_dir}/optimizer.pt")
     torch.save(scheduler.state_dict(), f"{ckpt_dir}/scheduler.pt")
-    meta = {"step": step, "best_metric": best_metric}
+    meta = {"step": step, "best_metric": best_metric, "epoch": epoch}
     with open(f"{ckpt_dir}/train_meta.json", "w") as f:
         json.dump(meta, f)
 
 
 def load_checkpoint(model: AsymmetricBiEncoderModel, optimizer, scheduler,
                     load_dir: str):
-    """Load model + optimizer + scheduler from checkpoint dir. Returns (step, best_metric)."""
+    """Load model + optimizer + scheduler from checkpoint dir. Returns (step, best_metric, epoch)."""
     ckpt_dir = load_dir
     if not os.path.isdir(ckpt_dir):
-        return 0, 0.0
+        return 0, 0.0, 0
 
     # Model weights
     variant = model.variant
@@ -171,13 +180,22 @@ def load_checkpoint(model: AsymmetricBiEncoderModel, optimizer, scheduler,
         scheduler.load_state_dict(torch.load(sch_path, map_location="cpu"))
 
     meta_path = f"{ckpt_dir}/train_meta.json"
-    step, best_metric = 0, 0.0
+    step, best_metric, epoch = 0, 0.0, 0
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
         step        = meta.get("step", 0)
         best_metric = meta.get("best_metric", 0.0)
-    return step, best_metric
+        epoch       = meta.get("epoch", 0)
+    return step, best_metric, epoch
+
+
+def find_latest_checkpoint(project_dir: str) -> str | None:
+    checkpoints_root = os.path.join(project_dir, "checkpoints")
+    checkpoint_dirs = sorted(glob.glob(os.path.join(checkpoints_root, "epoch_*")))
+    if not checkpoint_dirs:
+        return None
+    return checkpoint_dirs[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -231,22 +249,30 @@ def build_scheduler(optimizer, sch_cfg: dict, total_steps: int):
 # ---------------------------------------------------------------------------
 
 def train(cfg: dict, args: argparse.Namespace):
-    # ---- Timestamp-based run directory ----
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{cfg['project_name']}_{cfg['model']['variant']}_{cfg['model']['proj_type']}_{ts}"
-    project_dir = os.path.join(cfg["project_dir"], run_name)
-    os.makedirs(project_dir, exist_ok=True)
-
-    log_path = os.path.join(
-        "/data/rech/huiyuche/TREC_iKAT_2024/logs",
-        f"train_asym_{cfg['model']['variant']}_{cfg['model']['proj_type']}_{ts}.log"
-    )
-    logger = setup_logger(log_path)
-
     # ---- Accelerator (handles multi-GPU, mixed precision) ----
     accelerator = Accelerator(mixed_precision=cfg.get("mixed_precision", "no"))
     local_rank  = accelerator.local_process_index
     is_main     = accelerator.is_main_process
+
+    # ---- Shared timestamp-based run directory ----
+    ts_holder = [datetime.now().strftime("%Y%m%d_%H%M%S") if is_main else None]
+    if accelerator.num_processes > 1 and dist.is_initialized():
+        dist.broadcast_object_list(ts_holder, src=0)
+    ts = ts_holder[0]
+    run_name = f"{cfg['project_name']}_{cfg['model']['variant']}_{cfg['model']['proj_type']}_{ts}"
+    project_dir = os.path.join(cfg["project_dir"], run_name)
+    os.makedirs(project_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    log_dir = cfg.get(
+        "log_dir",
+        "/data/rech/zhangyan/multimodal_rag/baselines/logs"
+    )
+    log_path = os.path.join(
+        log_dir,
+        f"train_asym_{cfg['model']['variant']}_{cfg['model']['proj_type']}_{ts}.log"
+    )
+    logger = setup_logger(log_path)
 
     if is_main:
         logger.info(f"Run name    : {run_name}")
@@ -307,19 +333,28 @@ def train(cfg: dict, args: argparse.Namespace):
     # ---- Resume from checkpoint ----
     resume_step = 0
     best_metric = 0.0
+    start_epoch = 1
     if train_cfg.get("resume", False):
-        ckpt_dir = os.path.join(project_dir, "checkpoint")
-        if os.path.isdir(ckpt_dir):
-            resume_step, best_metric = load_checkpoint(
+        ckpt_dir = find_latest_checkpoint(project_dir)
+        if ckpt_dir and os.path.isdir(ckpt_dir):
+            resume_step, best_metric, last_epoch = load_checkpoint(
                 model, optimizer, scheduler, ckpt_dir
             )
+            start_epoch = last_epoch + 1
             if is_main:
-                logger.info(f"Resumed from step {resume_step}, best_metric={best_metric:.4f}")
+                logger.info(
+                    f"Resumed from {ckpt_dir} | step={resume_step}, "
+                    f"epoch={last_epoch}, best_metric={best_metric:.4f}"
+                )
 
     # ---- Accelerate prepare ----
     model, optimizer, loader, scheduler = accelerator.prepare(
         model, optimizer, loader, scheduler
     )
+    eval_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    evaluator = None
+    if eval_enabled:
+        evaluator = AsymmetricBiEncoderEvaluator(accelerator, model, cfg, project_dir)
 
     # ---- Hyperparameter summary ----
     if is_main:
@@ -349,7 +384,8 @@ def train(cfg: dict, args: argparse.Namespace):
     global_step      = resume_step
 
     # ---- Training loop ----
-    for epoch in range(1, num_epochs + 1):
+    target_metric_name = cfg.get("evaluation", {}).get("target_metric", "MRR@10")
+    for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         epoch_loss = 0.0
         t0_epoch   = time.time()
@@ -407,25 +443,6 @@ def train(cfg: dict, args: argparse.Namespace):
                     "train/epoch": epoch,
                 }, step=global_step)
 
-            # ---- Periodic evaluation ----
-            if global_step % eval_steps == 0:
-                # TODO: implement evaluation once all doc embeddings are ready
-                # For now just log a placeholder
-                if is_main:
-                    logger.info(f"[Eval] Step {global_step} – eval not yet implemented "
-                                f"(doc encoding still in progress)")
-                    wandb.log({"eval/placeholder": 0.0}, step=global_step)
-
-            # ---- Periodic checkpoint save ----
-            if is_main and global_step % save_steps == 0:
-                save_checkpoint(
-                    accelerator.unwrap_model(model),
-                    optimizer, scheduler,
-                    global_step, best_metric,
-                    project_dir, suffix=""
-                )
-                logger.info(f"Checkpoint saved at step {global_step}")
-
         # ---- End of epoch ----
         avg_loss = epoch_loss / max(len(loader), 1)
         elapsed  = time.time() - t0_epoch
@@ -437,10 +454,39 @@ def train(cfg: dict, args: argparse.Namespace):
                 "train/epoch":      epoch,
             }, step=global_step)
 
+        metrics = evaluator.evaluate(epoch=epoch, global_step=global_step) if evaluator else None
+        if is_main and metrics is not None:
+            metric_logs = {f"eval/{key}": value for key, value in metrics.items()}
+            wandb.log(metric_logs | {"eval/epoch": epoch}, step=global_step)
+            metrics_text = ", ".join(
+                f"{key}={value:.4f}" for key, value in sorted(metrics.items())
+            )
+            logger.info(f"[Eval] Epoch {epoch} | {metrics_text}")
+            best_metric = max(best_metric, metrics.get(target_metric_name, float("-inf")))
+
+            metric_slug = target_metric_name.lower().replace("@", "").replace(".", "_")
+            metric_value = metrics.get(target_metric_name, 0.0)
+            ckpt_dir = os.path.join(
+                project_dir,
+                "checkpoints",
+                f"epoch_{epoch:03d}_step_{global_step:05d}_{metric_slug}_{metric_value:.4f}",
+            )
+            save_checkpoint(
+                accelerator.unwrap_model(model),
+                optimizer,
+                scheduler,
+                global_step,
+                best_metric,
+                ckpt_dir,
+                epoch,
+            )
+            logger.info(f"Checkpoint saved to {ckpt_dir}")
+
     # ---- Final save ----
     if is_main:
+        save_root = cfg.get("save_root", "/data/rech/huiyuche/huggingface")
         final_dir = os.path.join(
-            "/data/rech/huiyuche/huggingface",
+            save_root,
             f"asym_biencoder_{cfg['model']['variant']}_{cfg['model']['proj_type']}"
         )
         accelerator.unwrap_model(model).save(final_dir)
@@ -484,6 +530,8 @@ def main():
         cfg["training"]["log_steps"]   = 1
         cfg["datasets"]["batch_size"]  = 4
         cfg["datasets"]["num_workers"] = 0  # avoid multiprocess issues in debug
+        cfg.setdefault("evaluation", {})
+        cfg["evaluation"]["enabled"] = False
         # Limit to already-encoded notes
         cfg["datasets"]["max_encoded_note_idx"] = 100000
         cfg["project_name"] = cfg["project_name"] + "_smoke"
