@@ -23,3 +23,5 @@ logs/
 __pycache__/
 *.pyc
 .cache/
+baselines/cache/asym_dataset/AsymmetricBiEncoderDataset_44024q_maxall.npz
+baselines/HANDOFF.md
